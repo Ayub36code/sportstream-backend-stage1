@@ -1,0 +1,925 @@
+// SportStream backend — Prisma schema
+// Design notes:
+// - Sport-specific concepts (scores, periods, participant shape) are modeled
+//   generically via EventPeriod / SportStatistic + JSON metadata, keyed by Sport,
+//   so we never assume "two teams" or football-only fields.
+// - All timestamps are stored in UTC (Postgres `timestamptz`); viewer timezone
+//   conversion happens at the API layer.
+// - BroadcastRights + RightsTerritory are checked independently at stream-publish
+//   time and at playback-request time.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  USER
+  ADMIN
+  CONTENT_MANAGER
+  STREAM_OPERATOR
+  SUPPORT
+  ANALYST
+}
+
+enum AccountStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+  DELETED
+}
+
+enum ParticipantType {
+  TEAM
+  ATHLETE
+}
+
+enum EventStatus {
+  SCHEDULED
+  DELAYED
+  LIVE
+  PAUSED
+  HALFTIME
+  COMPLETED
+  CANCELLED
+  ABANDONED
+  POSTPONED
+}
+
+enum DistributionMethod {
+  LIVE
+  REPLAY
+  HIGHLIGHTS
+  BOTH // live + replay
+}
+
+enum StreamStatus {
+  CREATED
+  STARTING
+  LIVE
+  INTERRUPTED
+  ENDED
+  TERMINATED
+  PROCESSING_REPLAY
+  FAILED
+}
+
+enum VideoAssetType {
+  LIVE_RECORDING
+  REPLAY
+  HIGHLIGHT
+  INTERVIEW
+  OTHER
+}
+
+enum PlanInterval {
+  DAILY
+  WEEKLY
+  MONTHLY
+  ANNUAL
+  EVENT_PASS
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+  EXPIRED
+  PENDING
+}
+
+enum PaymentProvider {
+  MTN_MOMO
+  AIRTEL_MONEY
+  STRIPE
+  MOCK
+}
+
+enum PaymentStatus {
+  INITIATED
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+  CANCELLED
+}
+
+enum NotificationChannel {
+  EMAIL
+  SMS
+  PUSH
+}
+
+enum NotificationType {
+  MATCH_REMINDER
+  KICKOFF_ALERT
+  EVENT_DELAY
+  SCORE_UPDATE
+  FINAL_RESULT
+  SYSTEM
+}
+
+enum SyncJobStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  PARTIAL
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// USERS & AUTH
+// ─────────────────────────────────────────────────────────────────────────
+
+model User {
+  id                String        @id @default(uuid())
+  email             String?       @unique
+  phone             String?       @unique
+  passwordHash      String
+  fullName          String?
+  role              UserRole      @default(USER)
+  status            AccountStatus @default(PENDING_VERIFICATION)
+  emailVerifiedAt   DateTime?
+  phoneVerifiedAt   DateTime?
+  preferredTimezone String        @default("Africa/Kampala")
+  preferredCurrency String        @default("UGX")
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  deletedAt         DateTime?
+
+  sessions              Session[]
+  verificationTokens    VerificationToken[]
+  subscriptions         Subscription[]
+  entitlements          Entitlement[]
+  payments              Payment[]
+  favorites             Favorite[]
+  watchHistory          WatchHistory[]
+  notifications         Notification[]
+  notificationPrefs     NotificationPreference[]
+  playbackSessions      PlaybackSession[]
+  auditLogsAsActor      AuditLog[]
+
+  @@index([status])
+  @@map("users")
+}
+
+model Session {
+  id                    String    @id @default(uuid())
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokenHash      String
+  userAgent             String?
+  ipAddress             String?
+  deviceLabel           String?
+  isRevoked             Boolean   @default(false)
+  expiresAt             DateTime
+  createdAt             DateTime  @default(now())
+  rotatedFromSessionId  String?
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model VerificationToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String
+  purpose   String // EMAIL_VERIFY | PHONE_VERIFY | PASSWORD_RESET
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId, purpose])
+  @@map("verification_tokens")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// GLOBAL SPORTS CATALOGUE
+// ─────────────────────────────────────────────────────────────────────────
+
+model Sport {
+  id         String   @id @default(uuid())
+  name       String   @unique
+  slug       String   @unique
+  config     Json     @default("{}") // sport-specific rules: scoring unit, period count/labels, participant shape
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  competitions    Competition[]
+  events          Event[]
+  participants    Participant[]
+  statistics      SportStatistic[]
+  broadcastRights BroadcastRights[]
+
+  @@map("sports")
+}
+
+model Country {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  isoCode2  String   @unique // e.g. UG
+  isoCode3  String   @unique // e.g. UGA
+  timezone  String   @default("UTC")
+  currency  String   @default("USD")
+  createdAt DateTime @default(now())
+
+  venues       Venue[]
+  teams        Team[]
+  athletes     Athlete[]
+  territories  RightsTerritory[]
+
+  @@map("countries")
+}
+
+model Venue {
+  id         String   @id @default(uuid())
+  name       String
+  city       String?
+  countryId  String
+  country    Country  @relation(fields: [countryId], references: [id])
+  timezone   String   @default("UTC")
+  capacity   Int?
+  latitude   Float?
+  longitude  Float?
+  createdAt  DateTime @default(now())
+
+  events Event[]
+
+  @@index([countryId])
+  @@map("venues")
+}
+
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  type      String // GOVERNING_BODY | FEDERATION | LEAGUE_OPERATOR
+  countryId String?
+  createdAt DateTime @default(now())
+
+  competitions Competition[]
+
+  @@map("organizations")
+}
+
+model Competition {
+  id             String   @id @default(uuid())
+  name           String
+  slug           String   @unique
+  sportId        String
+  sport          Sport    @relation(fields: [sportId], references: [id])
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  level          String // INTERNATIONAL | DOMESTIC | CLUB | INDIVIDUAL_TOUR
+  countryId      String? // null for international competitions
+  externalRefs   ExternalProviderRef[]
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  seasons Season[]
+  events  Event[]
+
+  @@index([sportId])
+  @@map("competitions")
+}
+
+model Season {
+  id            String   @id @default(uuid())
+  competitionId String
+  competition   Competition @relation(fields: [competitionId], references: [id], onDelete: Cascade)
+  name          String // e.g. "2026/27"
+  startDate     DateTime
+  endDate       DateTime
+  createdAt     DateTime @default(now())
+
+  stages Standing_CompetitionStage[]
+  events Event[]
+
+  @@index([competitionId])
+  @@map("seasons")
+}
+
+model Standing_CompetitionStage {
+  id        String   @id @default(uuid())
+  seasonId  String
+  season    Season   @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+  name      String // e.g. "Group Stage", "Quarter-Final", "Regular Season"
+  stageType String // GROUP | KNOCKOUT | ROUND_ROBIN | STANDALONE
+  order     Int      @default(0)
+
+  groups    StageGroup[]
+  events    Event[]
+  standings Standing[]
+
+  @@index([seasonId])
+  @@map("competition_stages")
+}
+
+model StageGroup {
+  id      String   @id @default(uuid())
+  stageId String
+  stage   Standing_CompetitionStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  name    String // e.g. "Group A"
+
+  events    Event[]
+  standings Standing[]
+
+  @@map("stage_groups")
+}
+
+model Standing {
+  id           String   @id @default(uuid())
+  stageId      String
+  stage        Standing_CompetitionStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  groupId      String?
+  group        StageGroup? @relation(fields: [groupId], references: [id])
+  participantId String
+  participant  Participant @relation(fields: [participantId], references: [id])
+  rank         Int?
+  points       Int?
+  stats        Json     @default("{}") // played/won/lost/drawn/goalDiff or sport-specific equivalents
+  updatedAt    DateTime @updatedAt
+
+  @@unique([stageId, groupId, participantId])
+  @@map("standings")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PARTICIPANTS: TEAMS, ATHLETES, UNIFIED "Participant"
+// ─────────────────────────────────────────────────────────────────────────
+
+model Team {
+  id         String   @id @default(uuid())
+  name       String
+  shortName  String?
+  slug       String   @unique
+  countryId  String?
+  country    Country? @relation(fields: [countryId], references: [id])
+  logoUrl    String?
+  isNationalTeam Boolean @default(false)
+  createdAt  DateTime @default(now())
+
+  participant Participant?
+  squadMembers AthleteTeamMembership[]
+
+  @@map("teams")
+}
+
+model Athlete {
+  id         String   @id @default(uuid())
+  fullName   String
+  slug       String   @unique
+  countryId  String?
+  country    Country? @relation(fields: [countryId], references: [id])
+  dateOfBirth DateTime?
+  photoUrl   String?
+  createdAt  DateTime @default(now())
+
+  participant Participant?
+  teamMemberships AthleteTeamMembership[]
+
+  @@map("athletes")
+}
+
+model AthleteTeamMembership {
+  id        String   @id @default(uuid())
+  athleteId String
+  athlete   Athlete  @relation(fields: [athleteId], references: [id], onDelete: Cascade)
+  teamId    String
+  team      Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  role      String? // e.g. captain, squad number
+  joinedAt  DateTime?
+  leftAt    DateTime?
+
+  @@index([athleteId])
+  @@index([teamId])
+  @@map("athlete_team_memberships")
+}
+
+/// Unifies Team / Athlete into one referenceable participant so Event/Standing
+/// models don't need to branch on participant type.
+model Participant {
+  id     String          @id @default(uuid())
+  sportId String
+  sport  Sport           @relation(fields: [sportId], references: [id])
+  type   ParticipantType
+  teamId String?         @unique
+  team   Team?           @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  athleteId String?      @unique
+  athlete Athlete?       @relation(fields: [athleteId], references: [id], onDelete: Cascade)
+
+  eventParticipations EventParticipant[]
+  standings           Standing[]
+  favorites           Favorite[]
+
+  @@index([sportId])
+  @@map("participants")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// EVENTS
+// ─────────────────────────────────────────────────────────────────────────
+
+model Event {
+  id             String       @id @default(uuid())
+  sportId        String
+  sport          Sport        @relation(fields: [sportId], references: [id])
+  competitionId  String?
+  competition    Competition? @relation(fields: [competitionId], references: [id])
+  seasonId       String?
+  season         Season?      @relation(fields: [seasonId], references: [id])
+  stageId        String?
+  stage          Standing_CompetitionStage? @relation(fields: [stageId], references: [id])
+  groupId        String?
+  group          StageGroup?  @relation(fields: [groupId], references: [id])
+  venueId        String?
+  venue          Venue?       @relation(fields: [venueId], references: [id])
+
+  name           String? // used for individual/multi-participant events e.g. "Men's 100m Final"
+  status         EventStatus  @default(SCHEDULED)
+  scheduledStart DateTime // UTC
+  actualStart    DateTime?
+  actualEnd      DateTime?
+  rescheduledFrom DateTime?
+  postponeReason String?
+
+  metadata       Json         @default("{}") // sport-specific extensible fields
+  externalRefs   ExternalProviderRef[]
+
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  participants   EventParticipant[]
+  periods        EventPeriod[]
+  incidents      EventIncident[]
+  statistics     SportStatistic[]
+  broadcastRights BroadcastRights[]
+  streams        Stream[]
+  videoAssets    VideoAsset[]
+  playbackSessions PlaybackSession[]
+  favorites      Favorite[]
+  watchHistory   WatchHistory[]
+  notifications  Notification[]
+
+  @@index([sportId, status, scheduledStart])
+  @@index([competitionId])
+  @@map("events")
+}
+
+model EventParticipant {
+  id            String   @id @default(uuid())
+  eventId       String
+  event         Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  participantId String
+  participant   Participant @relation(fields: [participantId], references: [id])
+  side          String? // "HOME" | "AWAY" | lane/bib number for individual sports
+  finalScore    Json?   // { value: number } or sport-specific shape (sets won, wickets, time)
+  result        String? // WIN | LOSS | DRAW | DNF | DSQ | null while in progress
+
+  @@unique([eventId, participantId])
+  @@index([eventId])
+  @@map("event_participants")
+}
+
+/// Generic period model: football halves, basketball quarters, tennis sets,
+/// cricket innings, race laps — all represented uniformly.
+model EventPeriod {
+  id         String   @id @default(uuid())
+  eventId    String
+  event      Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  label      String // "1st Half", "Q3", "Set 2", "Innings 1"
+  order      Int
+  startedAt  DateTime?
+  endedAt    DateTime?
+  scoreState Json     @default("{}") // per-participant score snapshot at end of period
+
+  @@index([eventId])
+  @@map("event_periods")
+}
+
+/// Discrete in-game events: goals, points, wickets, cards, substitutions, etc.
+model EventIncident {
+  id            String   @id @default(uuid())
+  eventId       String
+  event         Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  participantId String?
+  minute        Int?
+  type          String // GOAL | CARD | SUBSTITUTION | WICKET | POINT | LAP | PENALTY | etc.
+  detail        Json     @default("{}")
+  occurredAt    DateTime @default(now())
+
+  @@index([eventId])
+  @@map("event_incidents")
+}
+
+model SportStatistic {
+  id            String   @id @default(uuid())
+  sportId       String
+  sport         Sport    @relation(fields: [sportId], references: [id])
+  eventId       String
+  event         Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  participantId String?
+  statKey       String // e.g. "possession_pct", "aces", "overs_bowled"
+  statValue     Json
+
+  @@index([eventId])
+  @@map("sport_statistics")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// EXTERNAL PROVIDERS / SYNC (sports-data + generic external IDs)
+// ─────────────────────────────────────────────────────────────────────────
+
+model ExternalProvider {
+  id         String   @id @default(uuid())
+  name       String   @unique // e.g. "sportradar", "api-football"
+  type       String // SPORTS_DATA | VIDEO | PAYMENT | NOTIFICATION
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  refs     ExternalProviderRef[]
+  syncJobs SyncJob[]
+
+  @@map("external_providers")
+}
+
+/// Generic mapping table so any entity (Competition, Event, Team, Athlete...)
+/// can carry one or more external provider IDs without schema changes per provider.
+model ExternalProviderRef {
+  id           String   @id @default(uuid())
+  providerId   String
+  provider     ExternalProvider @relation(fields: [providerId], references: [id])
+  entityType   String // "Event" | "Competition" | "Team" | "Athlete"
+  entityId     String
+  externalId   String
+  lastSyncedAt DateTime?
+  Competition  Competition? @relation(fields: [competitionId], references: [id])
+  competitionId String?
+  Event        Event? @relation(fields: [eventId], references: [id])
+  eventId      String?
+
+  @@unique([providerId, entityType, externalId])
+  @@index([entityType, entityId])
+  @@map("external_provider_refs")
+}
+
+model SyncJob {
+  id            String        @id @default(uuid())
+  providerId    String
+  provider      ExternalProvider @relation(fields: [providerId], references: [id])
+  jobType       String // FIXTURES | RESULTS | STANDINGS | LIVE_SCORES
+  status        SyncJobStatus @default(PENDING)
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  recordsSynced Int           @default(0)
+  errorLog      Json?
+
+  @@index([providerId, jobType])
+  @@map("sync_jobs")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// BROADCASTING RIGHTS
+// ─────────────────────────────────────────────────────────────────────────
+
+model BroadcastRights {
+  id                 String   @id @default(uuid())
+  sportId            String?
+  sport              Sport?   @relation(fields: [sportId], references: [id])
+  competitionId      String?
+  eventId            String?
+  event              Event?   @relation(fields: [eventId], references: [id])
+  rightsHolder       String
+  contentOwner       String
+  licenceReference   String   @unique
+  distribution       DistributionMethod
+  platform           String // WEB | MOBILE | ALL
+  isExclusive        Boolean  @default(false)
+  validFrom          DateTime
+  validUntil         DateTime
+  blackoutWindows    Json     @default("[]") // [{ start, end, territoryCode? }]
+  status             String   @default("ACTIVE") // ACTIVE | EXPIRED | REVOKED
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  territories RightsTerritory[]
+  streams     Stream[]
+
+  @@index([eventId])
+  @@index([competitionId])
+  @@map("broadcast_rights")
+}
+
+model RightsTerritory {
+  id                String   @id @default(uuid())
+  broadcastRightsId String
+  broadcastRights   BroadcastRights @relation(fields: [broadcastRightsId], references: [id], onDelete: Cascade)
+  countryId         String?
+  country           Country? @relation(fields: [countryId], references: [id])
+  isWorldwide       Boolean  @default(false)
+  isExcluded        Boolean  @default(false) // supports "worldwide except X"
+
+  @@index([broadcastRightsId])
+  @@map("rights_territories")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// STREAMS & VIDEO LIBRARY
+// ─────────────────────────────────────────────────────────────────────────
+
+model Stream {
+  id                String   @id @default(uuid())
+  eventId           String
+  event             Event    @relation(fields: [eventId], references: [id])
+  broadcastRightsId String
+  broadcastRights   BroadcastRights @relation(fields: [broadcastRightsId], references: [id])
+  label             String? // e.g. "Main feed", "Commentary - Luganda"
+  status            StreamStatus @default(CREATED)
+  providerName      String // e.g. "mux", "mock"
+  providerAssetId   String? // never exposed to clients directly
+  playbackPolicy    String   @default("SIGNED") // PUBLIC | SIGNED | DRM
+  startedAt         DateTime?
+  endedAt           DateTime?
+  healthMetadata    Json     @default("{}")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  sources          StreamSource[]
+  playbackSessions PlaybackSession[]
+
+  @@index([eventId])
+  @@map("streams")
+}
+
+model StreamSource {
+  id             String   @id @default(uuid())
+  streamId       String
+  stream         Stream   @relation(fields: [streamId], references: [id], onDelete: Cascade)
+  bitrateProfile String // e.g. "240p", "480p", "720p", "1080p", "adaptive"
+  protocol       String // HLS | DASH
+  // Note: actual manifest/origin URLs are resolved server-side at playback time,
+  // never persisted here in a viewer-readable form.
+  providerRef    String?
+
+  @@index([streamId])
+  @@map("stream_sources")
+}
+
+model VideoAsset {
+  id              String         @id @default(uuid())
+  eventId         String?
+  event           Event?         @relation(fields: [eventId], references: [id])
+  type            VideoAssetType
+  title           String
+  description     String?
+  language        String         @default("en")
+  captionsUrl     String?
+  thumbnailUrl    String?
+  durationSeconds Int?
+  providerAssetId String? // storage/video-provider reference
+  replayAvailableFrom DateTime?
+  replayAvailableUntil DateTime?
+  isPublished     Boolean        @default(false)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  entitlements Entitlement[]
+  watchHistory WatchHistory[]
+
+  @@index([eventId])
+  @@map("video_assets")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PLAYBACK
+// ─────────────────────────────────────────────────────────────────────────
+
+model PlaybackSession {
+  id              String    @id @default(uuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id])
+  eventId         String?
+  event           Event?    @relation(fields: [eventId], references: [id])
+  streamId        String?
+  stream          Stream?   @relation(fields: [streamId], references: [id])
+  videoAssetId    String?
+  tokenHash       String // hash of the issued signed token/playback ticket
+  deviceLabel     String?
+  ipAddress       String?
+  startedAt       DateTime  @default(now())
+  expiresAt       DateTime
+  revokedAt       DateTime?
+  lastHeartbeatAt DateTime?
+
+  @@index([userId])
+  @@index([streamId])
+  @@map("playback_sessions")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// SUBSCRIPTIONS, PLANS, ENTITLEMENTS
+// ─────────────────────────────────────────────────────────────────────────
+
+model SubscriptionPlan {
+  id           String       @id @default(uuid())
+  name         String
+  code         String       @unique
+  description  String?
+  interval     PlanInterval
+  priceAmount  Decimal      @db.Decimal(12, 2)
+  currency     String       @default("UGX")
+  scope        String       @default("ALL_ACCESS") // ALL_ACCESS | COMPETITION | EVENT
+  scopeRefId   String?      // competitionId or eventId when scope != ALL_ACCESS
+  isActive     Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+
+  subscriptions Subscription[]
+
+  @@map("subscription_plans")
+}
+
+model Subscription {
+  id             String             @id @default(uuid())
+  userId         String
+  user           User               @relation(fields: [userId], references: [id])
+  planId         String
+  plan           SubscriptionPlan   @relation(fields: [planId], references: [id])
+  status         SubscriptionStatus @default(PENDING)
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+  cancelAtPeriodEnd  Boolean         @default(false)
+  cancelledAt        DateTime?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  entitlements Entitlement[]
+  payments     Payment[]
+
+  @@index([userId, status])
+  @@map("subscriptions")
+}
+
+model Entitlement {
+  id             String   @id @default(uuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id])
+  subscriptionId String?
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id])
+  scope          String // ALL_ACCESS | COMPETITION | EVENT | VIDEO_ASSET
+  competitionId  String?
+  eventId        String?
+  videoAssetId   String?
+  videoAsset     VideoAsset? @relation(fields: [videoAssetId], references: [id])
+  grantedAt      DateTime @default(now())
+  expiresAt      DateTime?
+  revokedAt      DateTime?
+
+  @@index([userId])
+  @@map("entitlements")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PAYMENTS
+// ─────────────────────────────────────────────────────────────────────────
+
+model Payment {
+  id               String        @id @default(uuid())
+  userId           String
+  user             User          @relation(fields: [userId], references: [id])
+  subscriptionId   String?
+  subscription     Subscription? @relation(fields: [subscriptionId], references: [id])
+  provider         PaymentProvider
+  providerRef      String?       // provider's transaction reference
+  idempotencyKey   String        @unique
+  amount           Decimal       @db.Decimal(12, 2)
+  currency         String
+  status           PaymentStatus @default(INITIATED)
+  failureReason    String?
+  metadata         Json          @default("{}")
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  webhookEvents PaymentWebhookEvent[]
+
+  @@index([userId])
+  @@index([provider, providerRef])
+  @@map("payments")
+}
+
+model PaymentWebhookEvent {
+  id              String   @id @default(uuid())
+  paymentId       String?
+  payment         Payment? @relation(fields: [paymentId], references: [id])
+  provider        PaymentProvider
+  externalEventId String   @unique // dedupe key from provider payload
+  payload         Json
+  processedAt     DateTime?
+  createdAt       DateTime @default(now())
+
+  @@map("payment_webhook_events")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// FAVORITES & WATCH HISTORY
+// ─────────────────────────────────────────────────────────────────────────
+
+model Favorite {
+  id            String   @id @default(uuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  participantId String?
+  participant   Participant? @relation(fields: [participantId], references: [id])
+  competitionId String?
+  eventId       String?
+  event         Event?   @relation(fields: [eventId], references: [id])
+  createdAt     DateTime @default(now())
+
+  @@unique([userId, participantId, competitionId, eventId])
+  @@index([userId])
+  @@map("favorites")
+}
+
+model WatchHistory {
+  id             String    @id @default(uuid())
+  userId         String
+  user           User      @relation(fields: [userId], references: [id])
+  eventId        String?
+  event          Event?    @relation(fields: [eventId], references: [id])
+  videoAssetId   String?
+  videoAsset     VideoAsset? @relation(fields: [videoAssetId], references: [id])
+  resumePositionSeconds Int  @default(0)
+  lastWatchedAt  DateTime  @default(now())
+  completedAt    DateTime?
+
+  @@unique([userId, eventId, videoAssetId])
+  @@index([userId])
+  @@map("watch_history")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// NOTIFICATIONS
+// ─────────────────────────────────────────────────────────────────────────
+
+model Notification {
+  id        String              @id @default(uuid())
+  userId    String
+  user      User                @relation(fields: [userId], references: [id])
+  eventId   String?
+  event     Event?              @relation(fields: [eventId], references: [id])
+  type      NotificationType
+  channel   NotificationChannel
+  title     String
+  body      String
+  status    String              @default("PENDING") // PENDING | SENT | FAILED | SUPPRESSED
+  dedupeKey String? // used to avoid duplicate sends
+  sentAt    DateTime?
+  createdAt DateTime            @default(now())
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, status])
+  @@map("notifications")
+}
+
+model NotificationPreference {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+  type         NotificationType
+  channel      NotificationChannel
+  isEnabled    Boolean  @default(true)
+  competitionId String?
+  participantId String?
+
+  @@unique([userId, type, channel, competitionId, participantId])
+  @@map("notification_preferences")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// AUDIT LOG
+// ─────────────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  actorId    String?
+  actor      User?    @relation(fields: [actorId], references: [id])
+  action     String // e.g. "RIGHTS_CREATED", "STREAM_TERMINATED", "USER_SUSPENDED"
+  entityType String
+  entityId   String?
+  metadata   Json     @default("{}")
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@map("audit_logs")
+}

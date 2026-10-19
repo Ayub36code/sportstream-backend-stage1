@@ -1,0 +1,37 @@
+import { Test, TestingModule } from '@nestjs/testing';
+import { INestApplication, ValidationPipe } from '@nestjs/common';
+import * as request from 'supertest';
+import { AppModule } from '../src/app.module';
+
+describe('Auth (e2e)', () => {
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    const moduleFixture: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+
+    app = moduleFixture.createNestApplication();
+    app.setGlobalPrefix('api/v1');
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+    await app.init();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it('rejects registration with a weak password', () => {
+    return request(app.getHttpServer())
+      .post('/api/v1/auth/register')
+      .send({ email: 'weak@example.com', password: '123' })
+      .expect(400);
+  });
+
+  it('rejects login with missing credentials', () => {
+    return request(app.getHttpServer())
+      .post('/api/v1/auth/login')
+      .send({})
+      .expect(400);
+  });
+});
